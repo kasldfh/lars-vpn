@@ -1,7 +1,7 @@
 PREFIX=/usr
 BINDIR=$(PREFIX)/bin
 
-CC=gcc
+CC=gcc -g
 INSTALL=ginstall
 
 all:	simpletun
@@ -15,4 +15,4 @@ install: all
 	$(INSTALL) -D simpletun $(DESTDIR)$(BINDIR)/simpletun
 
 macmask:
-	$(CC) simpletun.c -o simpletun
+	$(CC) simpletun.c buffer.c -o simpletun
