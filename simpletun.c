@@ -37,16 +37,30 @@
 #include <errno.h>
 #include <stdarg.h>
 #include "buffer.h"
+#include <pthread.h>
+#include <time.h>
+#include<errno.h>
 
 /* buffer for reading from tun/tap interface, must be >= 1500 */
-#define BUFSIZE 2000   
+#define BUFSIZE 65000 
+#define COMPSIZE BUFSIZE + 64
 #define CLIENT 0
 #define SERVER 1
 #define PORT 55555
 
+//1/2 second delay/interval
+#define DELAY_NSEC 500000000
+#include "minicomp/minicomp.h"
 int debug;
 char *progname;
 
+pthread_mutex_t lock;
+
+struct sender_args_struct {
+    int net_fd;
+    node_t ** payload_buffer;
+
+};
 /**************************************************************************
  * tun_alloc: allocates or reconnects to a tun/tap device. The caller     *
  *            must reserve enough space in *dev.                          *
@@ -104,7 +118,11 @@ int cwrite(int fd, char *buf, int n){
 
     int nwrite;
 
+    /* printf("In cwrite, fd is: %d, buf must be right, n is: %d\n", fd, n); */
+
     if((nwrite=write(fd, buf, n)) < 0){
+        /* printf("Problems w/ writing%s\n", strerror(errno)); */
+        /* fflush(stdout); */
         perror("Writing data");
         exit(1);
     }
@@ -173,6 +191,111 @@ void usage(void) {
     exit(1);
 }
 
+int sender(void* args_ptr) {
+    struct sender_args_struct * args  = (struct sender_args_struct * ) args_ptr;
+
+    //define the delay
+    struct timespec delay;
+    delay.tv_sec = 0;
+    delay.tv_nsec = DELAY_NSEC;
+    
+
+    //pointer to first node in the payload buffer
+    //TODO: locks/semaphores
+    //TODO: after freeing the current struct, we will have to update payload_buffer pointer
+    //to point to new head
+
+
+    node_t **payload_buffer = args->payload_buffer;
+    char comp_buffer[COMPSIZE];
+    uint16_t nwrite, plength;
+    int net_fd = args->net_fd;
+
+    //initialize the padding buffer
+    char zero_buffer[COMPSIZE];
+    for (int i = 0; i < COMPSIZE; i++) {
+        zero_buffer[i] = '0';
+    }
+    plength = htons(0);
+    memcpy(zero_buffer, (char*) &plength, sizeof(plength));
+
+    while(1) {
+        //LOCK THE LIST
+        pthread_mutex_lock(&lock);
+
+        node_t * node = *payload_buffer;
+        size_t byte_total = node->len;
+        size_t num_packets = node->num_packets;
+        char* packet_buffer = node->buffer;
+
+        //do_debug ("in while loop, byte total is: %d\n", byte_total);
+
+        //TODO: add delay feature
+        //there is a packet, so we send
+        if (byte_total > 2) {
+            //compress into comp_buffer, leaving enough space for prepending size
+            
+            do_debug("Buffer of length%d: %.*s\n", byte_total, byte_total, packet_buffer);
+            size_t comp_size = minicomp(comp_buffer+sizeof(plength), packet_buffer, byte_total, COMPSIZE);
+            
+            memcpy((char*) & plength, packet_buffer, sizeof(plength));
+            size_t num_pack_test = ntohs(plength);
+
+            if (comp_size > COMPSIZE) { //sanity check
+                do_debug("ERROR, TOO MANY COMPRESSED BYTES, This should never be reached!!!\n");
+                exit(1);
+            }
+
+            //prepend the size of compressed data to the packet
+            //needed for successful decompression
+            plength = htons(comp_size);
+            memcpy(comp_buffer, (char*) &plength, sizeof(plength));
+
+            //copy zeroes into buffer:
+            //TODO: uncomment this code to test after threding works
+            //am i off by one in number of bytes or anything? 
+            //memcpy(comp_buffer+offset, zero_buffer, COMPSIZE-offset);
+            size_t offset = comp_size + sizeof(plength);
+            for (int i = offset; i < COMPSIZE; i++) {
+                //fill buffer, for now with zeros
+                //TODO: we can optimize this using memcpy
+                comp_buffer[i] = '0';
+            }
+
+            nwrite = cwrite(net_fd, comp_buffer, COMPSIZE);
+
+            /* do_debug("wrote buffer: %s\n", buffer); */
+            /* do_debug("TAP2NET %lu: Written %d bytes to the network\n", tap2net, nwrite); */
+            //reset the buffers
+            byte_total = sizeof(plength);
+            comp_size = 0;
+            num_packets = 0;
+
+            if (node->next) {
+                *payload_buffer = node->next;
+            }
+            else {
+                    //create new node
+                    node_t *new_node = malloc(sizeof(node_t));
+                    new_node->buffer = malloc(sizeof(char) * BUFSIZE + 1);
+                    new_node->len = byte_total;
+                    new_node->num_packets = 0;
+                    *payload_buffer = new_node;
+            }
+            //TODO: free the node
+        }
+        else {
+            //write the padding bytes
+            nwrite = cwrite(net_fd, zero_buffer, COMPSIZE);
+            //todo: send a buffer with all zeros (if compsize is zero we will just ignore the packet)
+        }
+
+        pthread_mutex_unlock(&lock);
+        nanosleep(&delay, NULL);
+    }
+}
+
+
 int main(int argc, char *argv[]) {
 
     int tap_fd, option;
@@ -181,6 +304,7 @@ int main(int argc, char *argv[]) {
     int maxfd;
     uint16_t nread, nwrite, plength;
     char buffer[BUFSIZE];
+    char comp_buffer[COMPSIZE];
     struct sockaddr_in local, remote;
     char remote_ip[16] = "";            /* dotted quad IP string */
     unsigned short int port = PORT;
@@ -250,7 +374,7 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    do_debug("Successfully connected to interface %s\n", if_name);
+    do_debug("Successfully connected to interface, verifying with a write%s\n", if_name);
 
     if ( (sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("socket()");
@@ -309,10 +433,38 @@ int main(int argc, char *argv[]) {
         do_debug("SERVER: Client connected from %s\n", inet_ntoa(remote.sin_addr));
     }
 
+
     /* use select() to handle two descriptors at once */
     maxfd = (tap_fd > net_fd)?tap_fd:net_fd;
-    node_t * packet_buffer = NULL;
+    //node_t * packet_buffer = NULL;
+    /* char packet_buffer[BUFSIZE]; */
+    char *packet_buffer;
+
     size_t packet_buffer_len = 0;
+    size_t byte_total = sizeof(plength);//number of packets indicator at beginnign
+    size_t num_packets = 0;
+
+    //we want a pointer, so we can change the address of first node
+    //TODO: dynamically allocate this node, so we can free it like all the others
+    node_t * payload_buffer;
+    node_t node; 
+    payload_buffer = &node;
+
+    node.len = byte_total;
+    node.next = NULL;
+    node.buffer = malloc(sizeof(char) * BUFSIZE + 1);
+    node.num_packets = 0;
+
+    struct sender_args_struct args;
+    args.net_fd = net_fd;
+    args.payload_buffer = &payload_buffer;
+
+
+    pthread_t sender_thread;
+    if(pthread_create(&sender_thread, NULL, (void*) &sender, (void*) &args)) {
+        perror("pthread_create failed, exiting\n");
+        exit(1);
+    }
 
     while(1) {
 
@@ -335,113 +487,98 @@ int main(int argc, char *argv[]) {
         }
 
         if(FD_ISSET(tap_fd, &rd_set)) {
+            printf("\n\n****WRITING TO NETWORK***\n\n");
             /* data from tun/tap: just read it and write it to the network */
 
+            //find the node that we will append to (the last one)
+
+            //LOCK THE LIST
+            pthread_mutex_lock(&lock);
+
+            node_t * last_node = payload_buffer;
+            while (last_node->next) {
+                last_node = last_node->next;
+            }
+            packet_buffer = last_node->buffer;
+            byte_total = last_node->len;
+            num_packets = last_node->num_packets;
+            do_debug("Sanity: last_node->num_packets was: %lu\n", num_packets);
+
+            //TODO: need to actually initialize the values for last node somewhere
             nread = cread(tap_fd, buffer, BUFSIZE);
 
             tap2net++;
             do_debug("TAP2NET %lu: Read %d bytes from the tap interface\n", tap2net, nread);
 
-            /* write length + packet */
+            /***check if packet will fit in current node, else allocate a new node for it***/
+            //if it's greater than MTU, we need to verify that it compresses to <MTU
 
-            //TODO: buffer the packet
-            node_t * node = malloc(sizeof(node_t));
-            if(!node) {
-                perror("mallocing  node failed");
-                exit(1);
+            //TODO: make sure the size of buffer is >COMPSIZE, so we can compress it down
+            int check_compsize = 0;
+            if (byte_total + nread + sizeof(plength) > BUFSIZE) {
+                check_compsize = 1;
             }
-            node->buffer = malloc(sizeof(char) * nread);
 
-            node->len = nread;
-            memcpy(node->buffer, buffer, nread);
-            node->next = NULL;
+            /***add the packet to current node***/
+            num_packets++;
+            //put number of packets at beginning of buffer
+            plength = htons(num_packets); //first element is number of packets included in buffer
+            memcpy(packet_buffer, (char* ) & plength, sizeof(plength));
+            //we dont' increment byte_total after copying num_packets because we pre-allocated the constant sizeof(plength) above
 
-            if (!packet_buffer) {
-                packet_buffer = node;
+            //size of this packet
+            plength = htons(nread);
+            memcpy(packet_buffer + byte_total, (char*) & plength, sizeof(plength));
+            byte_total += sizeof(plength);
+            //append the packet's buffer
+            memcpy(packet_buffer + byte_total, buffer, nread);
+            byte_total += nread;
+
+            //TODO: buffer/destlen should be bufsize+64, not compsize, so we can get a true size
+            if(check_compsize) {
+                //if it's too big for the buffer
+                if (minicomp(comp_buffer, packet_buffer, byte_total, COMPSIZE) > COMPSIZE) {
+
+                    //ignore the "last packet" that was written into buffer
+                    num_packets--;
+                    plength = htons(num_packets); 
+                    memcpy(packet_buffer, (char* ) & plength, sizeof(plength));
+
+                    num_packets = 1;
+                    byte_total = sizeof(plength);//only 2 bytes so far, for num_packets
+
+                    //create new node
+                    node_t *new_node = malloc(sizeof(node_t));
+                    new_node->buffer = malloc(sizeof(char) * BUFSIZE + 1);
+                    new_node->num_packets = num_packets;
+                    new_node->len = byte_total;
+
+                    //update packet_buffer poiner
+                    packet_buffer = new_node->buffer;
+
+                    //write the new stuff into the buffer
+                    plength = htons(num_packets); 
+                    memcpy(packet_buffer, (char* ) & plength, sizeof(plength));
+
+                    plength = htons(nread);
+                    memcpy(packet_buffer + byte_total, (char*) & plength, sizeof(plength));
+                    byte_total += sizeof(plength);
+                    //append the packet's buffer
+                    memcpy(packet_buffer + byte_total, buffer, nread);
+                    byte_total += nread;
+
+
+                    new_node->len = byte_total;
+                    last_node->next = new_node;
+                }
             }
-            else {
-                node_t * cur = packet_buffer;
-                node_t * next = packet_buffer->next;
-                while(next) {
-                    cur = next;
-                    next = cur->next;
-                }
-                //now next is null, so we append to the list
-                cur->next = node;
-            }
-            packet_buffer_len++;
-
-            //awesome that this is the only place where we have to declare this, we don't have to worry about a "server" and a "client" programs being separate
-            //add to packet buffer
-            //for the beginning, if packet_buffer size is 4, send the traffic. Otherwise dont send
-            //later we will add the threading and all that
-
-            if (packet_buffer_len == 2) {
-
-                 plength = htons(packet_buffer->len);
-                 printf("sizeof plength was: %d\n", sizeof(plength));
-
-                do_debug("packet_buffer_len is 2, sending 2 packets from buffer: \n");
-                //TODO: determine number of packets to send
-                size_t num_packets = 2;
-                packet_buffer_len -= num_packets;
-                node_t * cur = packet_buffer;
-
-                size_t offset = 0;
-                //cast first 
-                plength = htons(num_packets); //first element is number of packets included in buffer
-                memcpy(buffer + offset, (char* ) & plength, sizeof(plength));
-                offset += sizeof(plength);
-                do_debug("offset should be 2, is %d\n", offset);
-
-                //sizeof(plength) is the amount of bytes we should offset each thing by. 
-                //sizeof(plength) should be a constant (2), but we will put in some checking for it
-
-                //buffer[1] will be len of first packet, etc
-                for (int i = 1; i <= num_packets; i++) {
-                    plength = htons(cur->len);
-                    memcpy(buffer + offset, (char*) &plength, sizeof(plength));
-                    offset += sizeof(plength);
-                    cur = cur->next;
-                }
-                cur = packet_buffer;
-                //populate the buffer
-                for (int i = 1; i <= num_packets; i++) {
-                    memcpy(buffer + offset, cur->buffer, cur->len);
-                    offset += cur->len;
-                    cur = cur->next;
-                }
-
-                //at the end of it, cur will equal the new head of packet_buffer (null)
-                packet_buffer = cur;
-                if (!packet_buffer) {
-                    do_debug("packet buffer is null, as expected\n");
-                }
-
-                
-
-                //send out the buffer
-                //TODO: is there an off by one in the bufsize-offset?
-                for (int i = offset; i < BUFSIZE; i++) {
-                    //fill buffer, for now with zeros
-                    buffer[i] = '0';
-                }
-                nwrite = cwrite(net_fd, buffer, BUFSIZE);
-
-                do_debug("wrote buffer: %s\n", buffer);
-                do_debug("TAP2NET %lu: Written %d bytes to the network\n", tap2net, nwrite);
 
 
+            last_node->len = byte_total;
+            last_node->num_packets = num_packets;
+            /***end adding packet to node***/
 
-
-                    //plength = htons(nread);
-                    //plength = htons(packet_buffer->len);
-                    //nwrite = cwrite(net_fd, (char *)&plength, sizeof(plength));
-                    //nwrite = cwrite(net_fd, buffer, nread);
-                    //nwrite = cwrite(net_fd, packet_buffer->buffer, nread);
-                    //packet_buffer = packet_buffer->next;
-                    //packet_buffer_len--;
-            }
+            pthread_mutex_unlock(&lock);
 
 
         }
@@ -462,49 +599,59 @@ int main(int argc, char *argv[]) {
 
             /* read packet */
             //nread = read_n(net_fd, buffer, ntohs(plength));
-            nread = read_n(net_fd, buffer, BUFSIZE);
-            do_debug("NET2TAP %lu: Read %d bytes from the network\n", net2tap, nread);
-            char print_buffer[BUFSIZE+1];
-            strncpy(print_buffer, buffer, BUFSIZE);
-            do_debug ("NET2TAP, print buffer: %s\n", print_buffer);
-
-            memcpy((char*) & plength, buffer, sizeof(plength));
-            size_t num_packets = ntohs(plength);
-            do_debug("Read number of packets, it is %d\n", num_packets);
-
-            //the buffer_offset is the location of the next packet buffer. 
-            //calculated by calculating space taken by num_packets and each packet's size
-            size_t buffer_offset = sizeof(plength) + sizeof(plength) * num_packets;
-            //TODO: describe size offset. it's basically the location of the next "packet size" in the buffer
-            size_t size_offset = sizeof(plength);
-            char tmp_buf[BUFSIZE];
-            for (int packet = 0; packet < num_packets; packet++) {
-                do_debug("Attempting to write %dth packet\n", packet);
-                //get the size of this packet
-                memcpy((char*) &plength, buffer+size_offset, sizeof(plength));
-                size_offset += sizeof(plength);
-                //get the buffer for this packet
-                memcpy(tmp_buf, buffer+buffer_offset, ntohs(plength));
-                buffer_offset += ntohs(plength);
-
-                /* nwrite = cwrite(tap_fd, buffer, nread); */
-                nwrite = cwrite(tap_fd, tmp_buf, ntohs(plength));
-                do_debug("NET2TAP %lu: Written %d bytes to the tap interface\n", net2tap, nwrite);
-
+            nread = read_n(net_fd, comp_buffer, COMPSIZE);
+            if (nread == 0) {
+                //    /* ctrl-c at the other end */
+                break;
             }
 
+            memcpy((char*) & plength, comp_buffer, sizeof(plength));
+            size_t comp_size = ntohs(plength);
+            if (comp_size) {
+                do_debug("\n\n***READ VALID DATA FROM NETWORK*****\n\n");
+                do_debug("Read a compsize of: %d\n", comp_size);
 
-            //so now we need to unwind the packet
-            //first is the number of packets
+                //decompress into buffer
+                nread = minidecomp(buffer, comp_buffer+sizeof(plength), comp_size, BUFSIZE);
+                /* memcpy(buffer, comp_buffer, comp_size); */
+                /* do_debug("NET2TAP %lu: Read %d bytes from the network\n", net2tap, nread); */
 
+                memcpy((char*) & plength, buffer, sizeof(plength));
+                size_t num_packets = ntohs(plength);
+                do_debug("num_packets: %lu, bytes: %lu\n", num_packets, nread);
 
+                size_t offset = sizeof(plength); //starting offset is just offset by initial packet number
+                char tmp_buf[BUFSIZE];
+                for (int packet = 0; packet < num_packets; packet++) {
+                    //get the size of this packet
+                    memcpy((char*) &plength, buffer+offset, sizeof(plength));
+                    offset += sizeof(plength);
+                    //get the buffer for this packet
+                    memcpy(tmp_buf, buffer+offset, ntohs(plength));
+                    offset += ntohs(plength);
 
-
-            /* now buffer[] contains a full packet or frame, write it into the tun/tap interface */ 
-            //no need to buffer the packet, because it is incoming so there is no need
-            //nwrite = cwrite(tap_fd, buffer, nread);
-            //do_debug("NET2TAP %lu: Written %d bytes to the tap interface\n", net2tap, nwrite);
+                    do_debug("Buffer of length%d: %.*s\n", ntohs(plength), ntohs(plength), tmp_buf);
+                    nwrite = cwrite(tap_fd, tmp_buf, ntohs(plength));
+                    do_debug("NET2TAP %lu: Written %d bytes to the tap interface\n", net2tap, nwrite);
+                }
+            }
+            //we read a padding packet
+            else {
+                do_debug("Read a padding packet!\n");
+            }
         }
+
+
+        //so now we need to unwind the packet
+        //first is the number of packets
+
+
+
+
+        /* now buffer[] contains a full packet or frame, write it into the tun/tap interface */ 
+        //no need to buffer the packet, because it is incoming so there is no need
+        //nwrite = cwrite(tap_fd, buffer, nread);
+        //do_debug("NET2TAP %lu: Written %d bytes to the tap interface\n", net2tap, nwrite);
     }
 
     return(0);

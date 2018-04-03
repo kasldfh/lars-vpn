@@ -20,6 +20,7 @@
 typedef struct node {
     size_t len;
     char* buffer;
+    size_t num_packets;
     struct node * next;
 } node_t;
 
