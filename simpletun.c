@@ -280,6 +280,7 @@ int sender(void* args_ptr) {
                     new_node->buffer = malloc(sizeof(char) * BUFSIZE + 1);
                     new_node->len = byte_total;
                     new_node->num_packets = 0;
+                    new_node->next = NULL;
                     *payload_buffer = new_node;
             }
             //TODO: free the node
