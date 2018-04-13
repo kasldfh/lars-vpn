@@ -15,5 +15,4 @@ install: all
 	$(INSTALL) -D simpletun $(DESTDIR)$(BINDIR)/simpletun
 
 simpletun: simpletun.c
-	$(CC) simpletun.c buffer.c minicomp/minicomp.c minicomp/dc_bytecounter.c -o simpletun -lz -lm -lpthread
-
+	$(CC) simpletun.c buffer.c minicomp/minicomp.c minicomp/dc_bytecounter.c -o simpletun -lz -lm -lpthread -std=gnu99
